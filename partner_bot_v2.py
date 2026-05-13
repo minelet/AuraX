@@ -3,11 +3,13 @@ import sqlite3
 import discord
 from discord import app_commands
 from discord.ext import commands
-
 import os
+
 TOKEN = os.getenv("TOKEN")
 
 intents = discord.Intents.default()
+intents.members = True
+intents.message_content = True  # FIX WARNING
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # =========================
@@ -33,17 +35,63 @@ CREATE TABLE IF NOT EXISTS partner_points (
 conn.commit()
 
 # =========================
+# LEADERBOARD STORAGE
+# =========================
+leaderboard_message_id = None
+leaderboard_channel_id = None
+
+# =========================
 # UTIL
 # =========================
 def extract_invite(text):
     match = re.search(r"(https?:\/\/)?(www\.)?(discord\.gg|discord\.com\/invite)\/[A-Za-z0-9]+", text)
     return match.group(0) if match else None
 
-
 def is_admin(member: discord.Member):
     return member.guild_permissions.administrator or any(
         role.name in ["Founder", "Administrator"] for role in member.roles
     )
+
+# =========================
+# LEADERBOARD FUNCTIONS
+# =========================
+async def get_leaderboard_text():
+    c.execute("SELECT user_id, points FROM partner_points ORDER BY points DESC LIMIT 10")
+    rows = c.fetchall()
+
+    if not rows:
+        return "No partners yet."
+
+    msg = "🏆 Leaderboard:\n"
+
+    for i, (uid, pts) in enumerate(rows, 1):
+        try:
+            user = await bot.fetch_user(uid)
+            name = user.name
+        except:
+            name = f"User {uid}"
+
+        msg += f"{i}. {name} - {pts}\n"
+
+    return msg
+
+async def update_leaderboard():
+    global leaderboard_message_id, leaderboard_channel_id
+
+    if not leaderboard_message_id or not leaderboard_channel_id:
+        return
+
+    channel = bot.get_channel(leaderboard_channel_id)
+    if not channel:
+        return
+
+    try:
+        message = await channel.fetch_message(leaderboard_message_id)
+    except:
+        return
+
+    new_text = await get_leaderboard_text()
+    await message.edit(content=new_text)
 
 # =========================
 # MODAL
@@ -57,8 +105,6 @@ class PartnerModal(discord.ui.Modal, title="Submit Partner Ad"):
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-
-        # 🔥 FIX: defer immediately to prevent timeout
         await interaction.response.defer(ephemeral=True)
 
         msg = self.message.value
@@ -71,23 +117,17 @@ class PartnerModal(discord.ui.Modal, title="Submit Partner Ad"):
         member = interaction.user
         admin = isinstance(member, discord.Member) and is_admin(member)
 
-        # ❌ Non-admin duplicate check
         if not admin:
             c.execute("SELECT 1 FROM partners WHERE link=?", (invite,))
             if c.fetchone():
-                await interaction.followup.send(
-                    "⚠️ This link was already partnered.",
-                    ephemeral=True
-                )
+                await interaction.followup.send("⚠️ This link was already partnered.", ephemeral=True)
                 return
 
-        # Save partner (admins can reuse but DB ignores duplicate safely)
         c.execute(
             "INSERT OR IGNORE INTO partners (user_id, link) VALUES (?,?)",
             (interaction.user.id, invite)
         )
 
-        # ✅ ALWAYS give point (this is what you wanted)
         c.execute("""
             INSERT INTO partner_points (user_id, points)
             VALUES (?, 1)
@@ -96,7 +136,6 @@ class PartnerModal(discord.ui.Modal, title="Submit Partner Ad"):
 
         conn.commit()
 
-        # ✅ NORMAL MESSAGE (NO GREY BOX)
         await interaction.channel.send(msg)
 
         await interaction.followup.send(
@@ -104,16 +143,16 @@ class PartnerModal(discord.ui.Modal, title="Submit Partner Ad"):
             ephemeral=True
         )
 
+        # 🔥 AUTO UPDATE
+        await update_leaderboard()
+
 # =========================
-# COMMAND: /partner
+# COMMANDS
 # =========================
 @bot.tree.command(name="partner", description="Submit partner message")
 async def partner(interaction: discord.Interaction):
     await interaction.response.send_modal(PartnerModal())
 
-# =========================
-# VIEW POINTS
-# =========================
 @bot.tree.command(name="partners_view", description="Check partner points")
 async def partners_view(interaction: discord.Interaction, user: discord.User = None):
     target = user or interaction.user
@@ -124,9 +163,6 @@ async def partners_view(interaction: discord.Interaction, user: discord.User = N
 
     await interaction.response.send_message(f"{target.name} has {points} partner points")
 
-# =========================
-# CHANGE POINTS (ADMIN ONLY)
-# =========================
 @bot.tree.command(name="partners_points_change", description="Set partner points (Admin only)")
 async def partners_points_change(interaction: discord.Interaction, user: discord.User, amount: int):
 
@@ -148,26 +184,20 @@ async def partners_points_change(interaction: discord.Interaction, user: discord
         ephemeral=True
     )
 
-# =========================
-# LEADERBOARD
-# =========================
+    # 🔥 AUTO UPDATE
+    await update_leaderboard()
+
 @bot.tree.command(name="partner_top", description="Leaderboard")
 async def partner_top(interaction: discord.Interaction):
+    global leaderboard_message_id, leaderboard_channel_id
 
-    c.execute("SELECT user_id, points FROM partner_points ORDER BY points DESC LIMIT 10")
-    rows = c.fetchall()
+    text = await get_leaderboard_text()
 
-    if not rows:
-        await interaction.response.send_message("No partners yet.")
-        return
+    await interaction.response.send_message(text)
+    msg = await interaction.original_response()
 
-    msg = "🏆 Leaderboard:\n"
-
-    for i, (uid, pts) in enumerate(rows, 1):
-        user = await bot.fetch_user(uid)
-        msg += f"{i}. {user.name} - {pts}\n"
-
-    await interaction.response.send_message(msg)
+    leaderboard_message_id = msg.id
+    leaderboard_channel_id = interaction.channel.id
 
 # =========================
 # READY
